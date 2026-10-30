@@ -12,7 +12,10 @@ namespace mpmc {
 
 constexpr std::size_t kCacheLineSize = 128;
 
-template <typename T>
+// PadSlots = true gives every slot its own cache line, so threads working on
+// neighbouring slots don't contend for the same line. Costs kCacheLineSize
+// bytes per slot instead of sizeof(T) + sizeof(size_t).
+template <typename T, bool PadSlots = false>
 class BoundedMpmcQueue {
     static_assert(std::is_move_constructible<T>::value,
                   "T must be move-constructible");
@@ -21,7 +24,7 @@ public:
     explicit BoundedMpmcQueue(std::size_t capacity)
         : capacity_(round_up_pow2(capacity < 2 ? 2 : capacity)),
           mask_(capacity_ - 1),
-          buffer_(static_cast<Slot*>(::operator new[](capacity_ * sizeof(Slot)))) {
+          buffer_(allocate(capacity_, Overaligned())) {
         for (std::size_t i = 0; i < capacity_; ++i) {
             new (&buffer_[i]) Slot();
             buffer_[i].sequence.store(i, std::memory_order_relaxed);
@@ -37,7 +40,7 @@ public:
         for (std::size_t i = 0; i < capacity_; ++i) {
             buffer_[i].~Slot();
         }
-        ::operator delete[](buffer_);
+        deallocate(buffer_, Overaligned());
     }
 
     BoundedMpmcQueue(const BoundedMpmcQueue&) = delete;
@@ -105,7 +108,7 @@ public:
     }
 
 private:
-    struct Slot {
+    struct alignas(PadSlots ? kCacheLineSize : 0) Slot {
         std::atomic<std::size_t> sequence;
         typename std::aligned_storage<sizeof(T), alignof(T)>::type storage;
 
@@ -124,6 +127,26 @@ private:
             return result;
         }
     };
+
+    using Overaligned =
+        std::integral_constant<bool, (alignof(Slot) > alignof(std::max_align_t))>;
+
+    static Slot* allocate(std::size_t n, std::false_type) {
+        return static_cast<Slot*>(::operator new[](n * sizeof(Slot)));
+    }
+    static void deallocate(Slot* p, std::false_type) { ::operator delete[](p); }
+
+#if defined(__cpp_aligned_new)
+    static Slot* allocate(std::size_t n, std::true_type) {
+        return static_cast<Slot*>(
+            ::operator new[](n * sizeof(Slot), std::align_val_t(alignof(Slot))));
+    }
+    static void deallocate(Slot* p, std::true_type) {
+        ::operator delete[](p, std::align_val_t(alignof(Slot)));
+    }
+#else
+    static_assert(!Overaligned::value, "PadSlots requires C++17 aligned new");
+#endif
 
     static std::size_t round_up_pow2(std::size_t v) {
         std::size_t p = 1;
